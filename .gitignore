@@ -1,0 +1,25 @@
+.DS_Store
+
+# Local Python environments
+.venv/
+venv/
+env/
+
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+pytest-of-*/
+
+# Packaging/build outputs
+*.egg-info/
+build/
+dist/
+
+# Local runtime scratch
+.tmp/
+*.log

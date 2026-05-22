@@ -1,0 +1,8 @@
+[sql.local_postgres]
+provider = "postgres"
+host = "127.0.0.1"
+port = 55432
+dbname = "jusi"
+user = "jusi"
+password = "jusi"
+initial_fetch = 25

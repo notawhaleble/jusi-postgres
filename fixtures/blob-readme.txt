@@ -1,0 +1,1 @@
+Jusi Postgres blob fixture
