@@ -11,37 +11,6 @@ from sqlparse.tokens import Keyword, Name
 from .metadata import MetadataSnapshot
 
 
-POSTGRES_KEYWORDS = [
-    "SELECT",
-    "FROM",
-    "WHERE",
-    "JOIN",
-    "LEFT",
-    "RIGHT",
-    "FULL",
-    "INNER",
-    "OUTER",
-    "ON",
-    "GROUP",
-    "BY",
-    "ORDER",
-    "HAVING",
-    "LIMIT",
-    "OFFSET",
-    "INSERT",
-    "INTO",
-    "UPDATE",
-    "DELETE",
-    "CREATE",
-    "ALTER",
-    "DROP",
-    "WITH",
-    "RETURNING",
-    "VALUES",
-    "EXPLAIN",
-]
-
-
 @dataclass(frozen=True)
 class QueryRelation:
     schema: str
@@ -63,26 +32,25 @@ class CompletionToken:
 def completion_items(snapshot: MetadataSnapshot, payload: dict[str, Any]) -> list[dict[str, Any]]:
     token = _completion_token(payload)
     prefix = token.value
-    prefix_lower = prefix.lower()
     line_text = str(payload.get("line_text", ""))
     cell_text = _sql_body(str(payload.get("cell_text", "")) or str(payload.get("content", "")))
     wants_relations = _wants_relations(line_text, token.end_col)
-    dotted = prefix.rsplit(".", 1) if "." in prefix else None
-    owner_prefix = dotted[0] if dotted else ""
-    value_prefix = dotted[1] if dotted else prefix
-    value_prefix_lower = value_prefix.lower()
+    parts = prefix.split(".")
     relations = parse_query_relations(cell_text)
     seen: set[tuple[str, str]] = set()
     items: list[dict[str, Any]] = []
 
-    def add(value: str, kind: str, *, label: str | None = None, detail: str = "", documentation: str | None = None) -> None:
-        if dotted:
-            if owner_prefix and not value.lower().startswith(owner_prefix.lower() + "."):
-                return
-            suffix = value.rsplit(".", 1)[-1]
-            if value_prefix and not suffix.lower().startswith(value_prefix_lower):
-                return
-        elif prefix and not value.lower().startswith(prefix_lower):
+    def add(
+        value: str,
+        kind: str,
+        *,
+        label: str | None = None,
+        detail: str = "",
+        documentation: str | None = None,
+        typed_prefix: str = "",
+        match_text: str | None = None,
+    ) -> None:
+        if typed_prefix and not (match_text or value).lower().startswith(typed_prefix.lower()):
             return
         key = (value, kind)
         if key in seen:
@@ -100,42 +68,79 @@ def completion_items(snapshot: MetadataSnapshot, payload: dict[str, Any]) -> lis
             }
         )
 
-    if not dotted and not wants_relations:
-        for keyword in POSTGRES_KEYWORDS:
-            add(keyword, "keyword", detail="keyword")
-
-    if not dotted:
+    if len(parts) == 1:
+        typed_prefix = parts[0]
         for schema in snapshot.schemas:
-            add(schema, "schema", detail="schema")
-        for item in snapshot.functions:
-            add(item.name, "function", detail=item.schema, documentation=item.detail or None)
-            add(f"{item.schema}.{item.name}", "function", label=item.name, detail=item.schema, documentation=item.detail or None)
-
-    for item in snapshot.objects:
-        add(item.name, item.kind, detail=item.schema)
-        add(f"{item.schema}.{item.name}", item.kind, label=item.name, detail=item.schema)
-
-    if wants_relations:
+            add(schema, "schema", detail="schema", typed_prefix=typed_prefix)
+        if not wants_relations:
+            for relation in relations:
+                add(
+                    relation.completion_prefix,
+                    "relation",
+                    detail=_relation_detail(relation),
+                    typed_prefix=typed_prefix,
+                )
         return items
 
-    for column in snapshot.columns:
-        if not dotted:
-            add(column.name, "column", detail=f"{column.schema}.{column.table}", documentation=column.data_type or None)
-        add(f"{column.table}.{column.name}", "column", label=column.name, detail=f"{column.schema}.{column.table}", documentation=column.data_type or None)
-        add(f"{column.schema}.{column.table}.{column.name}", "column", label=column.name, detail=f"{column.schema}.{column.table}", documentation=column.data_type or None)
-
-    for relation in relations:
+    if len(parts) == 2:
+        owner, typed_prefix = parts
+        for item in snapshot.objects:
+            if item.schema.lower() == owner.lower():
+                add(
+                    f"{item.schema}.{item.name}",
+                    item.kind,
+                    label=item.name,
+                    detail=item.schema,
+                    typed_prefix=typed_prefix,
+                    match_text=item.name,
+                )
+        if wants_relations:
+            return items
+        for item in snapshot.functions:
+            if item.schema.lower() == owner.lower():
+                add(
+                    f"{item.schema}.{item.name}",
+                    "function",
+                    label=item.name,
+                    detail=item.schema,
+                    documentation=item.detail or None,
+                    typed_prefix=typed_prefix,
+                    match_text=item.name,
+                )
         for column in snapshot.columns:
-            if relation.schema and column.schema.lower() != relation.schema.lower():
-                continue
-            if column.table.lower() != relation.table.lower():
+            for relation in relations:
+                if relation.completion_prefix.lower() != owner.lower():
+                    continue
+                if relation.schema and column.schema.lower() != relation.schema.lower():
+                    continue
+                if column.table.lower() != relation.table.lower():
+                    continue
+                add(
+                    f"{relation.completion_prefix}.{column.name}",
+                    "column",
+                    label=column.name,
+                    detail=f"{column.schema}.{column.table}",
+                    documentation=column.data_type or None,
+                    typed_prefix=typed_prefix,
+                    match_text=column.name,
+                )
+        return items
+
+    if len(parts) == 3:
+        schema, table, typed_prefix = parts
+        if wants_relations:
+            return items
+        for column in snapshot.columns:
+            if column.schema.lower() != schema.lower() or column.table.lower() != table.lower():
                 continue
             add(
-                f"{relation.completion_prefix}.{column.name}",
+                f"{column.schema}.{column.table}.{column.name}",
                 "column",
                 label=column.name,
                 detail=f"{column.schema}.{column.table}",
                 documentation=column.data_type or None,
+                typed_prefix=typed_prefix,
+                match_text=column.name,
             )
 
     return items
@@ -200,9 +205,21 @@ def _next_meaningful(tokens: list[Any], start: int) -> Any:
     return None
 
 
+def _relation_detail(relation: QueryRelation) -> str:
+    if relation.schema:
+        return f"{relation.schema}.{relation.table}"
+    return relation.table
+
+
 def _completion_token(payload: dict[str, Any]) -> CompletionToken:
     line_text = str(payload.get("line_text", ""))
     current_word = _completion_prefix(payload)
+    if not current_word:
+        cursor_col = _cursor_col(payload, line_text)
+        candidate = _sql_token_before(line_text, cursor_col)
+        if candidate.value:
+            return candidate
+        return CompletionToken("", cursor_col, cursor_col)
     for end_col in _candidate_end_cols(payload, line_text):
         candidate = _sql_token_before(line_text, end_col)
         if candidate.value and _token_matches_current_word(candidate.value, current_word):
@@ -210,9 +227,6 @@ def _completion_token(payload: dict[str, Any]) -> CompletionToken:
     fallback = _sql_token_before(line_text, len(line_text))
     if fallback.value:
         return fallback
-    current_word = str(payload.get("current_word", "")).strip()
-    if not current_word:
-        return CompletionToken("", None, None)
     start = max(0, len(line_text) - len(current_word))
     return CompletionToken(current_word.lstrip("([{\"'`").rstrip(",);]\"'`"), start, len(line_text))
 
@@ -225,9 +239,8 @@ def _completion_prefix(payload: dict[str, Any]) -> str:
 
 
 def _candidate_end_cols(payload: dict[str, Any], line_text: str) -> list[int]:
-    raw = payload.get("cursor_col")
-    if isinstance(raw, int):
-        cursor = max(0, min(raw, len(line_text)))
+    if isinstance(payload.get("cursor_col"), int):
+        cursor = _cursor_col(payload, line_text)
         candidates = [cursor]
         if cursor > 0:
             candidates.append(cursor - 1)
@@ -239,6 +252,13 @@ def _candidate_end_cols(payload: dict[str, Any], line_text: str) -> list[int]:
         if candidate not in unique:
             unique.append(candidate)
     return unique
+
+
+def _cursor_col(payload: dict[str, Any], line_text: str) -> int:
+    raw = payload.get("cursor_col")
+    if isinstance(raw, int):
+        return max(0, min(raw, len(line_text)))
+    return len(line_text)
 
 
 def _sql_token_before(line_text: str, end_col: int) -> CompletionToken:

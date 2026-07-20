@@ -26,6 +26,32 @@ from .state import target_cache_dir
 RESULT_QUERY_PREFIXES = ("select", "with", "values", "table")
 
 
+class RawBinaryValue:
+    __slots__ = ("value",)
+
+    def __init__(self, value: bytes | bytearray | memoryview) -> None:
+        self.value = value
+
+    @property
+    def size(self) -> int:
+        if isinstance(self.value, memoryview):
+            return self.value.nbytes
+        return len(self.value)
+
+    def tobytes(self) -> bytes:
+        if isinstance(self.value, memoryview):
+            return self.value.tobytes()
+        if isinstance(self.value, bytearray):
+            return bytes(self.value)
+        return self.value
+
+    def __str__(self) -> str:
+        return f"<binary data: {self.size} bytes>"
+
+    def __repr__(self) -> str:
+        return str(self)
+
+
 class PostgresSheetRuntime(SqlSheetRuntime):
     def handle_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
         return {"items": list(self.complete(dict(payload)) or ())}
@@ -191,19 +217,16 @@ class PostgresResultSheet(BaseSqlSheet):
         if self.exhausted or self.cursor is None:
             vd.status("PostgreSQL cursor is exhausted")
             return 0
-        set_plugin_execution_status("busy")
         try:
             with self.session.lock:
                 rows = self._fetch_rows(count)
             for row in rows:
-                self.addRow(list(row))
+                self.addRow(_display_row(row))
             self._notify_more()
             return len(rows)
         except Exception as exc:
             vd.warning(f"PostgreSQL fetch failed: {exc}")
             return 0
-        finally:
-            set_plugin_execution_status("follow-up")
 
     def close_cursor(self) -> None:
         cursor = self.cursor
@@ -228,7 +251,7 @@ class PostgresResultSheet(BaseSqlSheet):
         if description:
             yield column_names
         for row in rows:
-            yield list(row)
+            yield _display_row(row)
         for notice in self.session.pop_notices():
             vd.status(f"PostgreSQL notice: {notice}")
         self._notify_more()
@@ -245,7 +268,7 @@ class PostgresResultSheet(BaseSqlSheet):
                     rows = cursor.fetchall()
                     yield column_names
                     for row in rows:
-                        yield list(row)
+                        yield _display_row(row)
                 else:
                     self.columns = [ItemColumn("status", 0), ItemColumn("value", 1)]
                     status = str(getattr(cursor, "statusmessage", "") or "done")
@@ -368,6 +391,8 @@ def _postgres_sheet(sheet: Any) -> PostgresResultSheet | None:
 
 
 def _write_raw_value_file(value: Any, suffix: str) -> str:
+    if isinstance(value, RawBinaryValue):
+        value = value.tobytes()
     if isinstance(value, memoryview):
         value = value.tobytes()
     if isinstance(value, bytearray):
@@ -385,6 +410,18 @@ def _value_to_text(value: Any) -> str:
     if isinstance(value, (dict, list, tuple)):
         return json.dumps(value, ensure_ascii=False, default=str, indent=2)
     return "" if value is None else str(value)
+
+
+def _display_row(row: Any) -> list[Any]:
+    return [_display_cell(value) for value in row]
+
+
+def _display_cell(value: Any) -> Any:
+    if isinstance(value, RawBinaryValue):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return RawBinaryValue(value)
+    return value
 
 
 def _looks_like_result_query(sql: str) -> bool:

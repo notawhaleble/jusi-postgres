@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+from types import SimpleNamespace
 
 from jusi.plugins import DisplayHandlerSpec
 
@@ -13,7 +14,7 @@ from jusi_postgres.constants import POSTGRES_BOOTSTRAP_SQL
 from jusi_postgres.kernel import _parse_sql_line, _sql_blank_body_transformer, configure_sql_session, register_sql_magic
 from jusi_postgres.metadata import CompletionColumn, CompletionObject, MetadataCache, MetadataSnapshot
 from jusi_postgres.plugin import PostgresHandler, display_handler_specs
-from jusi_postgres.runner import _looks_like_result_query, _write_raw_value_file
+from jusi_postgres.runner import PostgresResultSheet, RawBinaryValue, _display_row, _looks_like_result_query, _write_raw_value_file
 from jusi_postgres.state import target_cache_dir
 
 
@@ -141,7 +142,75 @@ def test_completion_items_include_alias_columns() -> None:
     assert alias_item["end_col"] == len("select u.e")
 
 
-def test_completion_span_handles_vim_cursor_col_after_word() -> None:
+def test_completion_items_walk_database_objects_one_level_at_a_time() -> None:
+    snapshot = MetadataSnapshot(
+        schemas=["demo", "public"],
+        objects=[
+            CompletionObject(schema="demo", name="accounts", kind="table"),
+            CompletionObject(schema="demo", name="events", kind="table"),
+            CompletionObject(schema="public", name="users", kind="table"),
+        ],
+        columns=[
+            CompletionColumn(schema="demo", table="accounts", name="email", data_type="text"),
+            CompletionColumn(schema="demo", table="events", name="payload", data_type="jsonb"),
+        ],
+        functions=[CompletionObject(schema="demo", name="decode_event", kind="function", detail="jsonb")],
+        refreshed_at=1.0,
+    )
+
+    top_level = completion_items(
+        snapshot,
+        {
+            "current_word": "d",
+            "cursor_col": len("select d"),
+            "line_text": "select d",
+            "cell_text": "%%sql local_postgres\nselect d",
+        },
+    )
+    assert {item["value"] for item in top_level if item["kind"] == "schema"} == {"demo"}
+    assert all(item["kind"] != "keyword" for item in top_level)
+    assert "SELECT" not in {item["value"] for item in top_level}
+    assert "demo.accounts" not in {item["value"] for item in top_level}
+    assert "demo.accounts.email" not in {item["value"] for item in top_level}
+
+    empty_word = completion_items(
+        snapshot,
+        {
+            "current_word": "",
+            "cursor_col": len("select "),
+            "line_text": "select ",
+            "cell_text": "%%sql local_postgres\nselect ",
+        },
+    )
+    assert {item["value"] for item in empty_word if item["kind"] == "schema"} == {"demo", "public"}
+    assert {item["start_col"] for item in empty_word} == {len("select ")}
+    assert {item["end_col"] for item in empty_word} == {len("select ")}
+
+    schema_members = completion_items(
+        snapshot,
+        {
+            "current_word": "a",
+            "cursor_col": len("select demo.a"),
+            "line_text": "select demo.a",
+            "cell_text": "%%sql local_postgres\nselect demo.a",
+        },
+    )
+    assert [item["value"] for item in schema_members] == ["demo.accounts"]
+    assert all(item["kind"] != "column" for item in schema_members)
+
+    table_columns = completion_items(
+        snapshot,
+        {
+            "current_word": "e",
+            "cursor_col": len("select demo.accounts.e"),
+            "line_text": "select demo.accounts.e",
+            "cell_text": "%%sql local_postgres\nselect demo.accounts.e",
+        },
+    )
+    assert [item["value"] for item in table_columns] == ["demo.accounts.email"]
+
+
+def test_completion_span_handles_vim_cursor_col_after_qualified_word() -> None:
     snapshot = MetadataSnapshot(
         schemas=["public"],
         objects=[CompletionObject(schema="public", name="items", kind="table")],
@@ -153,20 +222,57 @@ def test_completion_span_handles_vim_cursor_col_after_word() -> None:
         snapshot,
         {
             "current_word": "value",
-            "cursor_col": 13,
-            "line_text": "select value from items",
-            "cell_text": "%%sql local_postgres\nselect value from items",
+            "cursor_col": len("select items.value"),
+            "line_text": "select items.value from items",
+            "cell_text": "%%sql local_postgres\nselect items.value from items",
         },
     )
-    value_item = next(item for item in items if item["value"] == "value" and item["kind"] == "column")
+    value_item = next(item for item in items if item["value"] == "items.value" and item["kind"] == "column")
     assert value_item["start_col"] == len("select ")
-    assert value_item["end_col"] == len("select value")
+    assert value_item["end_col"] == len("select items.value")
 
 
 def test_write_raw_value_file_preserves_binary_bytes() -> None:
     path = _write_raw_value_file(b"PK\x05\x06" + (b"\x00" * 18), ".zip")
     with open(path, "rb") as handle:
         assert handle.read(4) == b"PK\x05\x06"
+
+
+def test_binary_values_render_as_placeholder_but_preserve_raw_bytes() -> None:
+    row = _display_row([1, memoryview(b"abc"), bytearray(b"defg")])
+
+    assert row[0] == 1
+    assert isinstance(row[1], RawBinaryValue)
+    assert str(row[1]) == "<binary data: 3 bytes>"
+    assert repr(row[2]) == "<binary data: 4 bytes>"
+
+    path = _write_raw_value_file(row[1], ".bin")
+    with open(path, "rb") as handle:
+        assert handle.read() == b"abc"
+
+
+def test_fetch_more_does_not_change_plugin_execution_status(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    emitted_statuses: list[str] = []
+    added_rows: list[list[object]] = []
+    notified: list[bool] = []
+
+    sheet = object.__new__(PostgresResultSheet)
+    sheet.session = SimpleNamespace(lock=threading.RLock())
+    sheet.cursor_closed_reason = ""
+    sheet.exhausted = False
+    sheet.cursor = object()
+
+    monkeypatch.setattr("jusi_postgres.runner.set_plugin_execution_status", lambda status: emitted_statuses.append(status))
+    monkeypatch.setattr(PostgresResultSheet, "_fetch_rows", lambda self, count: [("new", b"raw")])
+    monkeypatch.setattr(PostgresResultSheet, "addRow", lambda self, row: added_rows.append(row))
+    monkeypatch.setattr(PostgresResultSheet, "_notify_more", lambda self: notified.append(True))
+
+    assert sheet.fetch_more(5) == 1
+    assert added_rows[0][0] == "new"
+    assert isinstance(added_rows[0][1], RawBinaryValue)
+    assert str(added_rows[0][1]) == "<binary data: 3 bytes>"
+    assert notified == [True]
+    assert emitted_statuses == []
 
 
 def test_metadata_snapshot_does_not_refresh_until_cell_entry(tmp_path) -> None:  # type: ignore[no-untyped-def]
