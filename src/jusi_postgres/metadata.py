@@ -4,12 +4,16 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 from .state import read_json, write_json
 
 
 METADATA_TTL_SECONDS = 60 * 60.0
+
+
+class MetadataLimitExceeded(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -84,10 +88,17 @@ class MetadataSnapshot:
 
 
 class MetadataCache:
-    def __init__(self, cache_dir: Path, loader: Callable[[], MetadataSnapshot]) -> None:
+    def __init__(
+        self,
+        cache_dir: Path,
+        loader: Callable[[], MetadataSnapshot],
+        *,
+        on_warning: Callable[[str], None] | None = None,
+    ) -> None:
         self.cache_dir = cache_dir
         self.cache_path = cache_dir / "metadata.json"
         self.loader = loader
+        self.on_warning = on_warning
         self._lock = threading.Lock()
         self._refreshing = False
         self._thread: threading.Thread | None = None
@@ -127,6 +138,10 @@ class MetadataCache:
         try:
             try:
                 snapshot = self.loader()
+            except MetadataLimitExceeded as exc:
+                if self.on_warning is not None:
+                    self.on_warning(str(exc))
+                return
             except Exception:
                 return
             else:
@@ -139,57 +154,100 @@ class MetadataCache:
                 self._refreshing = False
 
 
-def load_postgres_metadata(conn: Any) -> MetadataSnapshot:
+def load_postgres_metadata(
+    conn: Any,
+    *,
+    max_rows: int = 100_000,
+    schemas: Sequence[str] = (),
+) -> MetadataSnapshot:
+    collector = _BoundedMetadataCollector(max_rows=max_rows, schemas=schemas)
     with conn.cursor() as cur:
+        cur.execute(*collector.query("SELECT nspname FROM pg_namespace", "nspname"))
+        schema_names = sorted(str(row[0]) for row in collector.fetch(cur, "schemas"))
         cur.execute(
-            """
-            SELECT nspname
-            FROM pg_namespace
-            WHERE nspname NOT LIKE 'pg_toast%'
-            ORDER BY nspname
-            """
-        )
-        schemas = [str(row[0]) for row in cur.fetchall()]
-        cur.execute(
-            """
-            SELECT n.nspname, c.relname, c.relkind
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
-              AND n.nspname NOT LIKE 'pg_toast%'
-            ORDER BY n.nspname, c.relname
-            """
+            *collector.query(
+                """
+                SELECT n.nspname, c.relname, c.relkind
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                """,
+                "n.nspname",
+                extra_predicates=("c.relkind IN ('r', 'p', 'v', 'm', 'f')",),
+            )
         )
         objects = [
             CompletionObject(schema=str(row[0]), name=str(row[1]), kind=_relation_kind(str(row[2])))
-            for row in cur.fetchall()
+            for row in collector.fetch(cur, "relations")
         ]
+        objects.sort(key=lambda item: (item.schema, item.name, item.kind))
         cur.execute(
-            """
-            SELECT table_schema, table_name, column_name, data_type
-            FROM information_schema.columns
-            WHERE table_schema NOT LIKE 'pg_toast%'
-            ORDER BY table_schema, table_name, ordinal_position
-            """
+            *collector.query(
+                """
+                SELECT table_schema, table_name, column_name, data_type
+                FROM information_schema.columns
+                """,
+                "table_schema",
+            )
         )
         columns = [
             CompletionColumn(schema=str(row[0]), table=str(row[1]), name=str(row[2]), data_type=str(row[3]))
-            for row in cur.fetchall()
+            for row in collector.fetch(cur, "columns")
         ]
+        columns.sort(key=lambda item: (item.schema, item.table, item.name))
         cur.execute(
-            """
-            SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid)
-            FROM pg_proc p
-            JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE n.nspname NOT LIKE 'pg_toast%'
-            ORDER BY n.nspname, p.proname
-            """
+            *collector.query(
+                """
+                SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid)
+                FROM pg_proc p
+                JOIN pg_namespace n ON n.oid = p.pronamespace
+                """,
+                "n.nspname",
+            )
         )
         functions = [
             CompletionObject(schema=str(row[0]), name=str(row[1]), kind="function", detail=str(row[2]))
-            for row in cur.fetchall()
+            for row in collector.fetch(cur, "functions")
         ]
-    return MetadataSnapshot(schemas=schemas, objects=objects, columns=columns, functions=functions)
+        functions.sort(key=lambda item: (item.schema, item.name, item.detail))
+    return MetadataSnapshot(schemas=schema_names, objects=objects, columns=columns, functions=functions)
+
+
+class _BoundedMetadataCollector:
+    def __init__(self, *, max_rows: int, schemas: Sequence[str]) -> None:
+        self.max_rows = max_rows
+        self.schemas = tuple(schema for schema in schemas if schema)
+        self.collected = 0
+
+    def query(
+        self,
+        base_query: str,
+        schema_column: str,
+        *,
+        extra_predicates: Sequence[str] = (),
+    ) -> tuple[str, tuple[Any, ...]]:
+        predicates = list(extra_predicates)
+        params: list[Any] = []
+        predicates.append(f"{schema_column} NOT LIKE 'pg_toast%'")
+        if self.schemas:
+            predicates.append(f"{schema_column} = ANY(%s)")
+            params.append(list(self.schemas))
+        remaining = self.max_rows - self.collected + 1
+        return f"{base_query} WHERE {' AND '.join(predicates)} LIMIT %s", (*params, remaining)
+
+    def fetch(self, cursor: Any, label: str) -> list[Any]:
+        remaining = self.max_rows - self.collected
+        rows = list(cursor.fetchmany(remaining + 1))
+        if len(rows) > remaining:
+            schema_hint = ""
+            if self.schemas:
+                schema_hint = f" Current filter: {', '.join(self.schemas)}."
+            raise MetadataLimitExceeded(
+                f"PostgreSQL metadata collection stopped after reaching {self.max_rows} rows while loading {label}."
+                f"{schema_hint} Schema filtering is required: add or narrow metadata_schemas,"
+                " raise metadata_max_rows, or disable metadata."
+            )
+        self.collected += len(rows)
+        return rows
 
 
 def relation_names(snapshot: MetadataSnapshot) -> Iterable[tuple[str, str]]:

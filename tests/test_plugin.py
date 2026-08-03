@@ -12,9 +12,16 @@ from jusi.domain.models import JUSI_HANDLER_HANDOFF_MIME
 
 from jusi_postgres.constants import POSTGRES_BOOTSTRAP_SQL
 from jusi_postgres.kernel import _parse_sql_line, _sql_blank_body_transformer, configure_sql_session, register_sql_magic
-from jusi_postgres.metadata import CompletionColumn, CompletionObject, MetadataCache, MetadataSnapshot
+from jusi_postgres.metadata import (
+    CompletionColumn,
+    CompletionObject,
+    MetadataCache,
+    MetadataLimitExceeded,
+    MetadataSnapshot,
+    load_postgres_metadata,
+)
 from jusi_postgres.plugin import PostgresHandler, display_handler_specs
-from jusi_postgres.runner import PostgresResultSheet, RawBinaryValue, _display_row, _looks_like_result_query, _write_raw_value_file
+from jusi_postgres.runner import PostgresResultSheet, PostgresSession, RawBinaryValue, _display_row, _looks_like_result_query, _write_raw_value_file
 from jusi_postgres.state import target_cache_dir
 
 
@@ -48,10 +55,16 @@ def test_parse_postgres_options_keeps_psycopg_options_and_plugin_options() -> No
             "password": "secret",
             "initial_fetch": "25",
             "krb5ccname": "/tmp/krb5cc_test",
+            "collect_metadata": "false",
+            "metadata_max_rows": "250",
+            "metadata_schemas": "public,demo",
         }
     )
     assert options.initial_fetch == 25
     assert options.krb5ccname == "/tmp/krb5cc_test"
+    assert options.collect_metadata is False
+    assert options.metadata_max_rows == 250
+    assert options.metadata_schemas == ("public", "demo")
     assert options.connect == {"host": "db.example", "dbname": "analytics", "password": "secret"}
 
 
@@ -59,6 +72,18 @@ def test_parse_sql_line_supports_initial_fetch_magic_arg() -> None:
     alias, options = _parse_sql_line("analytics --initial-fetch 7")
     assert alias == "analytics"
     assert options == {"initial_fetch": 7}
+
+
+def test_parse_sql_line_supports_metadata_magic_args() -> None:
+    alias, options = _parse_sql_line(
+        "analytics --no-metadata --metadata-max-rows 500 --metadata-schema public --metadata-schema demo"
+    )
+    assert alias == "analytics"
+    assert options == {
+        "collect_metadata": False,
+        "metadata_max_rows": 500,
+        "metadata_schemas": ("public", "demo"),
+    }
 
 
 def test_kernel_substitutes_postgres_blank_body_bootstrap(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -309,3 +334,108 @@ def test_metadata_refresh_deduplicates_concurrent_cell_entries(tmp_path) -> None
     release.set()
     assert cache.close(timeout=2.0) is True
     assert calls == [True]
+
+
+class FakeMetadataCursor:
+    def __init__(self, result_sets: list[list[tuple[object, ...]]]) -> None:
+        self.result_sets = result_sets
+        self.executed: list[str] = []
+        self.rows: list[tuple[object, ...]] = []
+
+    def __enter__(self) -> "FakeMetadataCursor":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def execute(self, query: str, params: tuple[object, ...] = ()) -> None:
+        _ = params
+        self.executed.append(query)
+        self.rows = self.result_sets.pop(0)
+
+    def fetchmany(self, count: int) -> list[tuple[object, ...]]:
+        return self.rows[:count]
+
+
+class FakeMetadataConnection:
+    def __init__(self, result_sets: list[list[tuple[object, ...]]]) -> None:
+        self.cursor_obj = FakeMetadataCursor(result_sets)
+        self.closed = False
+        self.autocommit = False
+
+    def cursor(self) -> FakeMetadataCursor:
+        return self.cursor_obj
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_load_postgres_metadata_applies_schema_filter_and_limit() -> None:
+    conn = FakeMetadataConnection(
+        [
+            [("demo",)],
+            [("demo", "accounts", "r")],
+            [("demo", "accounts", "email", "text")],
+            [("demo", "decode_event", "jsonb")],
+        ]
+    )
+
+    snapshot = load_postgres_metadata(conn, max_rows=10, schemas=("demo",))
+
+    assert snapshot.schemas == ["demo"]
+    assert snapshot.objects[0].name == "accounts"
+    assert snapshot.columns[0].name == "email"
+    assert snapshot.functions[0].name == "decode_event"
+    assert all("= ANY(%s)" in query for query in conn.cursor_obj.executed)
+    assert all("LIMIT" in query for query in conn.cursor_obj.executed)
+
+
+def test_load_postgres_metadata_stops_when_limit_is_crossed() -> None:
+    conn = FakeMetadataConnection(
+        [
+            [("public",), ("demo",), ("extra",)],
+            [],
+            [],
+            [],
+        ]
+    )
+
+    try:
+        load_postgres_metadata(conn, max_rows=2)
+    except MetadataLimitExceeded as exc:
+        assert "reaching 2 rows" in str(exc)
+        assert "filter" in str(exc)
+    else:
+        raise AssertionError("expected metadata limit failure")
+
+
+def test_postgres_session_loads_metadata_with_separate_connection(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path))
+    metadata_conn = FakeMetadataConnection([[], [], [], []])
+    loaded: list[object] = []
+
+    def fake_connect(options: dict[str, object]) -> FakeMetadataConnection:
+        assert options == {"host": "db.example"}
+        return metadata_conn
+
+    def fake_load(conn: object, *, max_rows: int, schemas: tuple[str, ...]) -> MetadataSnapshot:
+        loaded.append(conn)
+        assert max_rows == 42
+        assert schemas == ("demo",)
+        return MetadataSnapshot(schemas=["demo"])
+
+    monkeypatch.setattr("jusi_postgres.runner._connect_psycopg", fake_connect)
+    monkeypatch.setattr("jusi_postgres.runner.load_postgres_metadata", fake_load)
+    session = PostgresSession(
+        alias="analytics",
+        connect_options={"host": "db.example"},
+        metadata_max_rows=42,
+        metadata_schemas=("demo",),
+    )
+
+    snapshot = session._load_metadata()
+
+    assert snapshot.schemas == ["demo"]
+    assert loaded == [metadata_conn]
+    assert session.conn is None
+    assert metadata_conn.closed is True

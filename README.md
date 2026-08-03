@@ -20,6 +20,26 @@ All psycopg connection options may be provided in the target config. The
 additional `krb5ccname` option points at a custom Kerberos credential cache and
 is passed to libpq through `KRB5CCNAME` while connecting.
 
+Metadata for SQL completion is collected asynchronously on a separate
+connection. Large catalogs should be filtered or disabled:
+
+```toml
+[sql.analytics]
+provider = "postgres"
+host = "db.example.com"
+dbname = "analytics"
+user = "me"
+metadata_schemas = ["public", "analytics"]
+metadata_max_rows = 100000
+collect_metadata = true
+```
+
+Use `collect_metadata = false` to skip completion metadata for a target. The
+same behavior can be changed per cell with `--no-metadata`,
+`--metadata-max-rows N`, and one or more `--metadata-schema NAME` arguments.
+If collection crosses `metadata_max_rows`, it stops and warns that schema
+filtering is required.
+
 VisiData mappings:
 
 - `1` to `9`: fetch that many more rows for the active result sheet.

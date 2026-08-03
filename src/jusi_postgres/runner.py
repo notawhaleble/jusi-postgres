@@ -19,7 +19,7 @@ from jusi_sql import BaseSqlSheet, SqlSheetRuntime, install_sql_base_sheet_api, 
 from .completion import completion_items
 from .config import kerberos_cache_env, parse_postgres_options
 from .constants import POSTGRES_BOOTSTRAP_SQL
-from .metadata import MetadataCache, load_postgres_metadata
+from .metadata import MetadataCache, MetadataSnapshot, load_postgres_metadata
 from .state import target_cache_dir
 
 
@@ -69,18 +69,30 @@ class PostgresSession:
         connect_options: dict[str, Any],
         krb5ccname: str = "",
         initial_fetch: int = 100,
+        collect_metadata: bool = True,
+        metadata_max_rows: int = 100_000,
+        metadata_schemas: tuple[str, ...] = (),
     ) -> None:
         self.alias = alias
         self.connect_options = connect_options
         self.krb5ccname = krb5ccname
         self.initial_fetch = initial_fetch
+        self.collect_metadata = collect_metadata
+        self.metadata_max_rows = metadata_max_rows
+        self.metadata_schemas = metadata_schemas
         self.conn: Any = None
+        self.metadata_conn: Any = None
+        self.metadata_conn_lock = threading.Lock()
         self.lock = threading.RLock()
         self.notices: list[str] = []
         self.sheets: list[PostgresResultSheet] = []
+        metadata_cache_options = dict(connect_options)
+        metadata_cache_options["__metadata_max_rows"] = metadata_max_rows
+        metadata_cache_options["__metadata_schemas"] = metadata_schemas
         self.metadata = MetadataCache(
-            target_cache_dir(alias, connect_options),
-            lambda: self.with_connection(lambda conn: load_postgres_metadata(conn), blocking=False),
+            target_cache_dir(alias, metadata_cache_options),
+            self._load_metadata,
+            on_warning=self._metadata_warning,
         )
 
     def connect(self) -> Any:
@@ -109,12 +121,15 @@ class PostgresSession:
         self.sheets.append(sheet)
 
     def complete(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        snapshot = self.metadata.snapshot()
+        snapshot = MetadataSnapshot() if not self.collect_metadata else self.metadata.snapshot()
         items = completion_items(snapshot, payload)
         emit_timing("sql.postgres.complete", alias=self.alias, item_count=len(items), current_word=str(payload.get("current_word", "")))
         return items
 
     def enter_cell(self) -> None:
+        if not self.collect_metadata:
+            emit_timing("sql.postgres.metadata.enter_cell", alias=self.alias, refresh_started=False, disabled=True)
+            return
         started = self.metadata.ensure_fresh_async()
         emit_timing("sql.postgres.metadata.enter_cell", alias=self.alias, refresh_started=started)
 
@@ -158,13 +173,51 @@ class PostgresSession:
     def close(self) -> None:
         metadata_done = self.metadata.close(timeout=2.0)
         if not metadata_done:
-            self.interrupt()
+            self._cancel_metadata()
         for sheet in list(self.sheets):
             sheet.close_cursor()
         conn = self.conn
         if conn is not None and not conn.closed:
             conn.close()
             emit_timing("sql.postgres.connection.closed", alias=self.alias)
+
+    def _load_metadata(self) -> Any:
+        with kerberos_cache_env(self.krb5ccname):
+            conn = _connect_psycopg(dict(self.connect_options))
+        with self.metadata_conn_lock:
+            self.metadata_conn = conn
+        try:
+            try:
+                conn.autocommit = True
+            except Exception:
+                pass
+            return load_postgres_metadata(
+                conn,
+                max_rows=self.metadata_max_rows,
+                schemas=self.metadata_schemas,
+            )
+        finally:
+            with self.metadata_conn_lock:
+                self.metadata_conn = None
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _cancel_metadata(self) -> None:
+        with self.metadata_conn_lock:
+            conn = self.metadata_conn
+        if conn is None or conn.closed:
+            return
+        try:
+            conn.cancel()
+            vd.warning("PostgreSQL metadata collection cancellation requested")
+        except Exception as exc:
+            vd.warning(f"PostgreSQL metadata cancellation failed: {exc}")
+
+    def _metadata_warning(self, message: str) -> None:
+        emit_timing("sql.postgres.metadata.warning", alias=self.alias, warning=message)
+        vd.warning(message)
 
     def pop_notices(self) -> list[str]:
         notices = list(self.notices)
@@ -501,6 +554,9 @@ def run_postgres_runner() -> int:
             connect_options=options.connect,
             krb5ccname=options.krb5ccname,
             initial_fetch=options.initial_fetch,
+            collect_metadata=options.collect_metadata,
+            metadata_max_rows=options.metadata_max_rows,
+            metadata_schemas=options.metadata_schemas,
         )
         _install_signal_handlers(session)
         session.enter_cell()

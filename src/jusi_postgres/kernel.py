@@ -125,6 +125,9 @@ def _parse_sql_line(line: str) -> tuple[str, dict[str, object]]:
     parser = argparse.ArgumentParser(prog="%%sql", add_help=False)
     parser.add_argument("alias")
     parser.add_argument("--initial-fetch", type=int, dest="initial_fetch")
+    parser.add_argument("--no-metadata", action="store_true", dest="no_metadata")
+    parser.add_argument("--metadata-max-rows", type=int, dest="metadata_max_rows")
+    parser.add_argument("--metadata-schema", action="append", dest="metadata_schemas")
     namespace, unknown = parser.parse_known_args(parts)
     if unknown:
         raise UsageError(f"Unknown %%sql option(s): {' '.join(unknown)}")
@@ -133,4 +136,12 @@ def _parse_sql_line(line: str) -> tuple[str, dict[str, object]]:
         if namespace.initial_fetch < 0:
             raise UsageError("--initial-fetch must be >= 0")
         options["initial_fetch"] = namespace.initial_fetch
+    if namespace.no_metadata:
+        options["collect_metadata"] = False
+    if namespace.metadata_max_rows is not None:
+        if namespace.metadata_max_rows < 1:
+            raise UsageError("--metadata-max-rows must be >= 1")
+        options["metadata_max_rows"] = namespace.metadata_max_rows
+    if namespace.metadata_schemas:
+        options["metadata_schemas"] = tuple(namespace.metadata_schemas)
     return str(namespace.alias), options
