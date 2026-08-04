@@ -503,7 +503,41 @@ def _connect_psycopg(connect_options: dict[str, Any]) -> Any:
             "Missing dependency 'psycopg'. Install this plugin with dependencies, "
             "for example: ./.venv/bin/python -m pip install -e ."
         ) from exc
-    return psycopg.connect(**connect_options)
+    conn = psycopg.connect(**connect_options)
+    _install_infinity_timestamp_loaders(conn)
+    return conn
+
+
+def _install_infinity_timestamp_loaders(conn: Any) -> None:
+    try:
+        from psycopg.types.datetime import DateLoader, TimestampLoader, TimestamptzLoader
+    except Exception:
+        return
+
+    class DateInfinityLoader(DateLoader):  # type: ignore[misc, valid-type]
+        def load(self, data: Any) -> Any:
+            text = bytes(data).decode("ascii")
+            if text in ("infinity", "-infinity"):
+                return text
+            return super().load(data)
+
+    class TimestampInfinityLoader(TimestampLoader):  # type: ignore[misc, valid-type]
+        def load(self, data: Any) -> Any:
+            text = bytes(data).decode("ascii")
+            if text in ("infinity", "-infinity"):
+                return text
+            return super().load(data)
+
+    class TimestamptzInfinityLoader(TimestamptzLoader):  # type: ignore[misc, valid-type]
+        def load(self, data: Any) -> Any:
+            text = bytes(data).decode("ascii")
+            if text in ("infinity", "-infinity"):
+                return text
+            return super().load(data)
+
+    conn.adapters.register_loader("date", DateInfinityLoader)
+    conn.adapters.register_loader("timestamp", TimestampInfinityLoader)
+    conn.adapters.register_loader("timestamptz", TimestamptzInfinityLoader)
 
 
 def _load_payload() -> dict[str, Any]:

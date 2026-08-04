@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
+from types import ModuleType
 from types import SimpleNamespace
 
 from jusi.plugins import DisplayHandlerSpec
@@ -21,7 +23,15 @@ from jusi_postgres.metadata import (
     load_postgres_metadata,
 )
 from jusi_postgres.plugin import PostgresHandler, display_handler_specs
-from jusi_postgres.runner import PostgresResultSheet, PostgresSession, RawBinaryValue, _display_row, _looks_like_result_query, _write_raw_value_file
+from jusi_postgres.runner import (
+    PostgresResultSheet,
+    PostgresSession,
+    RawBinaryValue,
+    _connect_psycopg,
+    _display_row,
+    _looks_like_result_query,
+    _write_raw_value_file,
+)
 from jusi_postgres.state import target_cache_dir
 
 
@@ -274,6 +284,43 @@ def test_binary_values_render_as_placeholder_but_preserve_raw_bytes() -> None:
     path = _write_raw_value_file(row[1], ".bin")
     with open(path, "rb") as handle:
         assert handle.read() == b"abc"
+
+
+def test_connect_psycopg_registers_infinity_timestamp_loaders(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    class FakeAdapters:
+        def __init__(self) -> None:
+            self.loaders: dict[str, type[object]] = {}
+
+        def register_loader(self, name: str, loader: type[object]) -> None:
+            self.loaders[name] = loader
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.adapters = FakeAdapters()
+
+    class FakeBaseLoader:
+        def load(self, data: object) -> object:
+            return ("decoded", bytes(data))  # type: ignore[arg-type]
+
+    fake_conn = FakeConnection()
+    psycopg_module = ModuleType("psycopg")
+    psycopg_module.connect = lambda **options: fake_conn  # type: ignore[attr-defined]
+    psycopg_types_module = ModuleType("psycopg.types")
+    psycopg_datetime_module = ModuleType("psycopg.types.datetime")
+    psycopg_datetime_module.DateLoader = FakeBaseLoader  # type: ignore[attr-defined]
+    psycopg_datetime_module.TimestampLoader = FakeBaseLoader  # type: ignore[attr-defined]
+    psycopg_datetime_module.TimestamptzLoader = FakeBaseLoader  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "psycopg", psycopg_module)
+    monkeypatch.setitem(sys.modules, "psycopg.types", psycopg_types_module)
+    monkeypatch.setitem(sys.modules, "psycopg.types.datetime", psycopg_datetime_module)
+
+    conn = _connect_psycopg({"host": "db.example"})
+
+    assert conn is fake_conn
+    assert set(fake_conn.adapters.loaders) == {"date", "timestamp", "timestamptz"}
+    assert fake_conn.adapters.loaders["timestamptz"]().load(b"infinity") == "infinity"
+    assert fake_conn.adapters.loaders["timestamp"]().load(b"-infinity") == "-infinity"
+    assert fake_conn.adapters.loaders["date"]().load(b"2026-08-05") == ("decoded", b"2026-08-05")
 
 
 def test_fetch_more_does_not_change_plugin_execution_status(monkeypatch) -> None:  # type: ignore[no-untyped-def]
