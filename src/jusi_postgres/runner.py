@@ -17,7 +17,7 @@ from jusi.visidata_support import bind_visidata_runtime, set_plugin_execution_st
 from jusi_sql import BaseSqlSheet, SqlSheetRuntime, install_sql_base_sheet_api, queue_sql_sheet, resolve_sql_target
 
 from .completion import completion_items
-from .config import kerberos_cache_env, parse_postgres_options
+from .config import DEFAULT_METADATA_MAX_ROWS, kerberos_cache_env, parse_postgres_options
 from .constants import POSTGRES_BOOTSTRAP_SQL
 from .metadata import MetadataCache, MetadataSnapshot, load_postgres_metadata
 from .state import target_cache_dir
@@ -70,7 +70,7 @@ class PostgresSession:
         krb5ccname: str = "",
         initial_fetch: int = 100,
         collect_metadata: bool = True,
-        metadata_max_rows: int = 100_000,
+        metadata_max_rows: int = DEFAULT_METADATA_MAX_ROWS,
         metadata_schemas: tuple[str, ...] = (),
     ) -> None:
         self.alias = alias
@@ -83,6 +83,8 @@ class PostgresSession:
         self.conn: Any = None
         self.metadata_conn: Any = None
         self.metadata_conn_lock = threading.Lock()
+        self.metadata_warning_lock = threading.Lock()
+        self.metadata_warnings: list[str] = []
         self.lock = threading.RLock()
         self.notices: list[str] = []
         self.sheets: list[PostgresResultSheet] = []
@@ -121,6 +123,7 @@ class PostgresSession:
         self.sheets.append(sheet)
 
     def complete(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        self.show_metadata_warnings()
         snapshot = MetadataSnapshot() if not self.collect_metadata else self.metadata.snapshot()
         items = completion_items(snapshot, payload)
         emit_timing("sql.postgres.complete", alias=self.alias, item_count=len(items), current_word=str(payload.get("current_word", "")))
@@ -217,7 +220,15 @@ class PostgresSession:
 
     def _metadata_warning(self, message: str) -> None:
         emit_timing("sql.postgres.metadata.warning", alias=self.alias, warning=message)
-        vd.warning(message)
+        with self.metadata_warning_lock:
+            self.metadata_warnings.append(message)
+
+    def show_metadata_warnings(self) -> None:
+        with self.metadata_warning_lock:
+            warnings = list(self.metadata_warnings)
+            self.metadata_warnings.clear()
+        for message in warnings:
+            vd.warning(message)
 
     def pop_notices(self) -> list[str]:
         notices = list(self.notices)
@@ -257,8 +268,8 @@ class PostgresResultSheet(BaseSqlSheet):
             else:
                 yield from self._load_statement()
         except Exception as exc:
-            self.columns = [ItemColumn("error", 0)]
-            yield [f"{exc.__class__.__name__}: {exc}"]
+            vd.exceptionCaught(exc)
+            vd.warning(f"PostgreSQL query failed: {exc.__class__.__name__}: {exc}; press Ctrl-E for details")
             emit_timing("sql.postgres.iterload.error", alias=self.session.alias, error_type=type(exc).__name__, error=str(exc))
         finally:
             set_plugin_execution_status("follow-up")
@@ -307,6 +318,7 @@ class PostgresResultSheet(BaseSqlSheet):
             yield _display_row(row)
         for notice in self.session.pop_notices():
             vd.status(f"PostgreSQL notice: {notice}")
+        self.session.show_metadata_warnings()
         self._notify_more()
 
     def _load_statement(self):  # type: ignore[no-untyped-def]
@@ -332,6 +344,7 @@ class PostgresResultSheet(BaseSqlSheet):
                     for notice in self.session.pop_notices():
                         yield ["notice", notice]
                     self.session.metadata.mark_stale()
+        self.session.show_metadata_warnings()
 
     def _fetch_rows(self, count: int) -> list[Any]:
         if self.cursor is None:

@@ -300,6 +300,34 @@ def test_fetch_more_does_not_change_plugin_execution_status(monkeypatch) -> None
     assert emitted_statuses == []
 
 
+def test_iterload_records_errors_in_visidata_error_sheet(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    emitted_statuses: list[str] = []
+    captured_errors: list[Exception] = []
+    warnings: list[str] = []
+
+    class FakeSession:
+        alias = "analytics"
+
+        def register_sheet(self, sheet: object) -> None:
+            _ = sheet
+
+    def fail_result_query(self: PostgresResultSheet):  # type: ignore[no-untyped-def]
+        _ = self
+        raise RuntimeError("missing Kerberos ticket")
+        yield
+
+    monkeypatch.setattr("jusi_postgres.runner.set_plugin_execution_status", lambda status: emitted_statuses.append(status))
+    monkeypatch.setattr("jusi_postgres.runner.vd.exceptionCaught", lambda exc: captured_errors.append(exc))
+    monkeypatch.setattr("jusi_postgres.runner.vd.warning", lambda message: warnings.append(message))
+    monkeypatch.setattr(PostgresResultSheet, "_load_result_query", fail_result_query)
+    sheet = PostgresResultSheet(session=FakeSession(), query="select 1")  # type: ignore[arg-type]
+
+    assert list(sheet.iterload()) == []
+    assert [type(exc).__name__ for exc in captured_errors] == ["RuntimeError"]
+    assert "PostgreSQL query failed: RuntimeError: missing Kerberos ticket" in warnings[0]
+    assert emitted_statuses == ["busy", "follow-up"]
+
+
 def test_metadata_snapshot_does_not_refresh_until_cell_entry(tmp_path) -> None:  # type: ignore[no-untyped-def]
     calls: list[bool] = []
 
@@ -439,3 +467,18 @@ def test_postgres_session_loads_metadata_with_separate_connection(monkeypatch, t
     assert loaded == [metadata_conn]
     assert session.conn is None
     assert metadata_conn.closed is True
+
+
+def test_postgres_session_queues_metadata_warnings_for_runtime_display(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path))
+    emitted: list[str] = []
+    monkeypatch.setattr("jusi_postgres.runner.vd.warning", lambda message: emitted.append(message))
+    session = PostgresSession(alias="analytics", connect_options={"host": "db.example"})
+
+    session._metadata_warning("metadata too large")
+
+    assert emitted == []
+    session.show_metadata_warnings()
+    assert emitted == ["metadata too large"]
+    session.show_metadata_warnings()
+    assert emitted == ["metadata too large"]

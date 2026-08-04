@@ -30,7 +30,7 @@ host = "db.example.com"
 dbname = "analytics"
 user = "me"
 metadata_schemas = ["public", "analytics"]
-metadata_max_rows = 100000
+metadata_max_rows = 1000000
 collect_metadata = true
 ```
 

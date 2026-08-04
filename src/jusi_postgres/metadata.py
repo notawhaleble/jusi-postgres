@@ -157,7 +157,7 @@ class MetadataCache:
 def load_postgres_metadata(
     conn: Any,
     *,
-    max_rows: int = 100_000,
+    max_rows: int = 1_000_000,
     schemas: Sequence[str] = (),
 ) -> MetadataSnapshot:
     collector = _BoundedMetadataCollector(max_rows=max_rows, schemas=schemas)

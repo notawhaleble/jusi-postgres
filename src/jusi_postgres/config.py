@@ -16,7 +16,7 @@ PLUGIN_OPTIONS = {
     "metadata_schemas",
 }
 
-DEFAULT_METADATA_MAX_ROWS = 100_000
+DEFAULT_METADATA_MAX_ROWS = 1_000_000
 
 
 @dataclass(frozen=True)
