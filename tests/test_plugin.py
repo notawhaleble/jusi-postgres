@@ -364,6 +364,20 @@ def test_metadata_refresh_deduplicates_concurrent_cell_entries(tmp_path) -> None
     assert calls == [True]
 
 
+def test_metadata_refresh_reports_loader_failures(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    warnings: list[str] = []
+
+    def load() -> MetadataSnapshot:
+        raise RuntimeError("bad metadata query")
+
+    cache = MetadataCache(tmp_path, load, on_warning=warnings.append)
+
+    assert cache.ensure_fresh_async() is True
+    assert cache.close(timeout=2.0) is True
+    assert warnings == ["PostgreSQL metadata collection failed: RuntimeError: bad metadata query"]
+    assert cache.snapshot().schemas == []
+
+
 class FakeMetadataCursor:
     def __init__(self, result_sets: list[list[tuple[object, ...]]]) -> None:
         self.result_sets = result_sets

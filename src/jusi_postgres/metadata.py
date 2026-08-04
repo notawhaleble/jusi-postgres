@@ -142,7 +142,9 @@ class MetadataCache:
                 if self.on_warning is not None:
                     self.on_warning(str(exc))
                 return
-            except Exception:
+            except Exception as exc:
+                if self.on_warning is not None:
+                    self.on_warning(f"PostgreSQL metadata collection failed: {exc.__class__.__name__}: {exc}")
                 return
             else:
                 snapshot.refreshed_at = time.time()
