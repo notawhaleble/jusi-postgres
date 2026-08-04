@@ -382,6 +382,7 @@ class FakeMetadataCursor:
     def __init__(self, result_sets: list[list[tuple[object, ...]]]) -> None:
         self.result_sets = result_sets
         self.executed: list[str] = []
+        self.params: list[tuple[object, ...]] = []
         self.rows: list[tuple[object, ...]] = []
 
     def __enter__(self) -> "FakeMetadataCursor":
@@ -393,6 +394,7 @@ class FakeMetadataCursor:
     def execute(self, query: str, params: tuple[object, ...] = ()) -> None:
         _ = params
         self.executed.append(query)
+        self.params.append(params)
         self.rows = self.result_sets.pop(0)
 
     def fetchmany(self, count: int) -> list[tuple[object, ...]]:
@@ -430,6 +432,7 @@ def test_load_postgres_metadata_applies_schema_filter_and_limit() -> None:
     assert snapshot.functions[0].name == "decode_event"
     assert all("= ANY(%s)" in query for query in conn.cursor_obj.executed)
     assert all("LIMIT" in query for query in conn.cursor_obj.executed)
+    assert all(params[0] == "pg_toast%" for params in conn.cursor_obj.params)
 
 
 def test_load_postgres_metadata_stops_when_limit_is_crossed() -> None:

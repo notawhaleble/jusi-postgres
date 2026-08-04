@@ -229,7 +229,8 @@ class _BoundedMetadataCollector:
     ) -> tuple[str, tuple[Any, ...]]:
         predicates = list(extra_predicates)
         params: list[Any] = []
-        predicates.append(f"{schema_column} NOT LIKE 'pg_toast%'")
+        predicates.append(f"{schema_column} NOT LIKE %s")
+        params.append("pg_toast%")
         if self.schemas:
             predicates.append(f"{schema_column} = ANY(%s)")
             params.append(list(self.schemas))
