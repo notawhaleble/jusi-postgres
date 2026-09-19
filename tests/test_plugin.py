@@ -12,7 +12,7 @@ import pytest
 
 from jusi.plugin_api import OperationRejected, WorkerContext
 from jusi.protocol import validate_plugin_kernel_message
-from jusi_sql import CompletionColumn, CompletionObject, MetadataSnapshot, find_sql_actions
+from jusi_sql import CompletionColumn, CompletionObject, MetadataSnapshot, SqlCompletionRequest, find_sql_actions
 from jusi_sql.kernel import _reset_runtime_for_tests, dispatch_sql
 
 from jusi_postgres.catalog import catalog_entry
@@ -24,9 +24,11 @@ from jusi_postgres.runner import (
     PostgresResultSheet,
     PostgresSession,
     RawBinaryValue,
+    _complete_postgres_sql,
     _connect_psycopg,
     _display_row,
     _followup_sql,
+    _initialize_visidata_application,
     _looks_like_result_query,
     _write_raw_value_file,
 )
@@ -41,7 +43,7 @@ def test_catalog_is_an_exact_jusi_1_sql_provider() -> None:
     entry = catalog_entry()
     assert entry == {
         "plugin_id": "postgres",
-        "plugin_version": "0.2.0",
+        "plugin_version": "0.2.1",
         "distribution": "jusi-postgres",
         "families": [{
             "family_id": "sql",
@@ -118,6 +120,59 @@ def test_kerberos_cache_env_restores_previous_value(monkeypatch) -> None:  # typ
 def test_followup_preserves_literal_sql_but_removes_magic_header() -> None:
     assert _followup_sql("select 1") == "select 1"
     assert _followup_sql("%%sql analytics\nselect α") == "select α"
+
+
+def test_blank_relation_completion_returns_only_schemas() -> None:
+    prefix = "select * from "
+    request = SqlCompletionRequest(prefix, prefix, len(prefix), 0, len(prefix))
+    snapshot = MetadataSnapshot(
+        schemas=["demo", "public"],
+        objects=[CompletionObject("accounts", "demo", "table")],
+        columns=[CompletionColumn("accounts", "email", "demo", "text")],
+        functions=[CompletionObject("decode_event", "demo", "function")],
+    )
+
+    result = _complete_postgres_sql(snapshot, request)
+
+    assert [(item["text"], item["kind"]) for item in result["items"]] == [
+        ("demo", "schema"),
+        ("public", "schema"),
+    ]
+    assert {(item["start"], item["end"]) for item in result["items"]} == {
+        (len(prefix), len(prefix)),
+    }
+
+
+def test_typed_relation_completion_keeps_matching_metadata() -> None:
+    prefix = "select * from acc"
+    request = SqlCompletionRequest(prefix, prefix, len(prefix), 0, len(prefix))
+    snapshot = MetadataSnapshot(
+        schemas=["demo"],
+        objects=[CompletionObject("accounts", "demo", "table")],
+    )
+
+    result = _complete_postgres_sql(snapshot, request)
+
+    assert "accounts" in {item["text"] for item in result["items"]}
+
+
+def test_application_loads_visidata_config_before_provider_commands(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls = []
+    monkeypatch.setattr(
+        "jusi.visidata_support.initialize_visidata",
+        lambda **kwargs: calls.append(("initialize", kwargs)),
+    )
+    monkeypatch.setattr(
+        "jusi_postgres.runner.install_postgres_commands",
+        lambda: calls.append(("commands", {})),
+    )
+
+    _initialize_visidata_application()
+
+    assert calls == [
+        ("initialize", {"open_name": "selection.sql", "open_filetype": "sql"}),
+        ("commands", {}),
+    ]
 
 
 def test_worker_returns_one_terminal_and_delegates_to_family_router(monkeypatch) -> None:  # type: ignore[no-untyped-def]

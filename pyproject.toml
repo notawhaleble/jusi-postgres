@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jusi-postgres"
-version = "0.2.0"
+version = "0.2.1"
 description = "PostgreSQL provider plugin for Jusi SQL"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,7 +13,7 @@ authors = [
   { name = "Jusi contributors" }
 ]
 dependencies = [
-  "jusi>=1.0,<2",
+  "jusi>=1.0.2,<2",
   "jusi-sql>=0.2,<0.3",
   "psycopg[binary]>=3.1",
   "visidata>=3,<4",

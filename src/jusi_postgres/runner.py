@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import curses
 from pathlib import Path
+import re
 import sys
 import tempfile
 import threading
@@ -37,6 +38,9 @@ POSTGRES_KEYWORDS = (
     "VALUES", "UPDATE", "SET", "DELETE", "RETURNING", "WITH", "AS", "DISTINCT",
     "CREATE", "ALTER", "DROP", "TABLE", "VIEW", "INDEX", "BEGIN", "COMMIT", "ROLLBACK",
 )
+POSTGRES_RELATION_KEYWORDS = frozenset({
+    "FROM", "JOIN", "INTO", "UPDATE", "TABLE", "VIEW", "DESCRIBE", "DESC",
+})
 _PENDING_SHEETS: deque[Any] = deque()
 
 
@@ -129,7 +133,7 @@ class PostgresSession:
     def complete(self, request: SqlCompletionRequest) -> dict[str, Any]:
         self.show_metadata_warnings()
         snapshot = MetadataSnapshot() if not self.collect_metadata else self.metadata.snapshot()
-        return complete_sql(snapshot, request, keywords=POSTGRES_KEYWORDS)
+        return _complete_postgres_sql(snapshot, request)
 
     def enter_cell(self) -> None:
         if not self.collect_metadata:
@@ -238,6 +242,30 @@ class PostgresSession:
     def _mark_cursors_closed(self, reason: str) -> None:
         for sheet in self.sheets:
             sheet.cursor_closed_reason = reason
+
+
+def _complete_postgres_sql(
+    snapshot: MetadataSnapshot,
+    request: SqlCompletionRequest,
+) -> dict[str, list[dict[str, Any]]]:
+    if _is_blank_relation_context(request.prefix):
+        snapshot = MetadataSnapshot(
+            schemas=list(snapshot.schemas),
+            refreshed_at=snapshot.refreshed_at,
+        )
+    return complete_sql(
+        snapshot,
+        request,
+        keywords=POSTGRES_KEYWORDS,
+        relation_keywords=POSTGRES_RELATION_KEYWORDS,
+    )
+
+
+def _is_blank_relation_context(prefix: str) -> bool:
+    if not prefix or not prefix[-1].isspace():
+        return False
+    words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", prefix)
+    return bool(words and words[-1].upper() in POSTGRES_RELATION_KEYWORDS)
 
 
 class PostgresResultSheet(SequenceSheet):
@@ -396,6 +424,13 @@ def install_postgres_commands() -> None:
     setattr(visidata.BaseSheet, "_jusi_postgres_commands_v1", True)
 
 
+def _initialize_visidata_application() -> None:
+    from jusi.visidata_support import initialize_visidata
+
+    initialize_visidata(open_name="selection.sql", open_filetype="sql")
+    install_postgres_commands()
+
+
 def _queue_sheet(sheet: PostgresResultSheet) -> None:
     _PENDING_SHEETS.append(sheet)
     vd.queueCommand("jusi-postgres-open-pending-sheet")
@@ -540,10 +575,7 @@ def _handle_application_operation(session: PostgresSession, operation: str, payl
 def run_postgres_application(payload_path: Path, socket_path: str) -> int:
     session: PostgresSession | None = None
     try:
-        from jusi.plugins.vd.application import install_editor_actions
-
-        install_postgres_commands()
-        install_editor_actions()
+        _initialize_visidata_application()
         visidata.vd.timeouts_before_idle = -1
         payload = _read_payload(payload_path)
         query = str(payload.get("sql", "")).strip() or POSTGRES_BOOTSTRAP_SQL

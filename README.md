@@ -55,6 +55,10 @@ transaction, and server-side cursors. `JusiInterrupt` requests cancellation on
 that connection. Closing the client closes its cursors, metadata connection,
 main connection, private control socket, and staged launch data.
 
+The terminal application loads normal VisiData user configuration and plugins
+before installing Jusi and PostgreSQL commands. This includes `~/.visidatarc`
+and paths selected through `VD_CONFIG` and `VD_DIR`.
+
 ## Local development database
 
 Start a disposable PostgreSQL fixture:
