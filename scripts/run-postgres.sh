@@ -37,7 +37,7 @@ PostgreSQL is running.
 
 jusi.toml:
 
-[sql.local_postgres]
+[sql.targets.local_postgres]
 provider = "postgres"
 host = "127.0.0.1"
 port = ${HOST_PORT}

@@ -1,4 +1,4 @@
-[sql.local_postgres]
+[sql.targets.local_postgres]
 provider = "postgres"
 host = "127.0.0.1"
 port = 55432

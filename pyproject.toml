@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jusi-postgres"
-version = "0.1.0"
+version = "0.2.0"
 description = "PostgreSQL provider plugin for Jusi SQL"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,18 +13,21 @@ authors = [
   { name = "Jusi contributors" }
 ]
 dependencies = [
-  "jusi",
-  "jusi-sql",
+  "jusi>=1.0,<2",
+  "jusi-sql>=0.2,<0.3",
   "psycopg[binary]>=3.1",
-  "sqlparse>=0.4",
   "visidata>=3,<4",
 ]
 
-[project.entry-points."jusi.display_handlers"]
-postgres = "jusi_postgres.plugin:display_handler_specs"
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[project.entry-points."jusi.plugins.v1"]
+postgres = "jusi_postgres.catalog:catalog_entry"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/jusi_postgres"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+testpaths = ["tests"]

@@ -1,13 +1,14 @@
 # jusi-postgres
 
-`jusi-postgres` is the PostgreSQL provider plugin for the shared `jusi-sql`
-layer. It exposes the `postgres` SQL provider for `%%sql` cells resolved
-through the active Jusi session config.
+`jusi-postgres` is the PostgreSQL exact-provider plugin for Jusi 1.0 and the
+shared `jusi-sql` family. It exposes the `postgres`/`postgresql` provider for
+`%%sql` cells. The family owns target selection, magic dispatch, completion
+ranges, metadata caching, operation routing, and common VisiData SQL commands.
 
 Example session config:
 
 ```toml
-[sql.analytics]
+[sql.targets.analytics]
 provider = "postgres"
 host = "localhost"
 port = 5432
@@ -24,7 +25,7 @@ Metadata for SQL completion is collected asynchronously on a separate
 connection. Large catalogs should be filtered or disabled:
 
 ```toml
-[sql.analytics]
+[sql.targets.analytics]
 provider = "postgres"
 host = "db.example.com"
 dbname = "analytics"
@@ -34,11 +35,10 @@ metadata_max_rows = 1000000
 collect_metadata = true
 ```
 
-Use `collect_metadata = false` to skip completion metadata for a target. The
-same behavior can be changed per cell with `--no-metadata`,
-`--metadata-max-rows N`, and one or more `--metadata-schema NAME` arguments.
-If collection crosses `metadata_max_rows`, it stops and warns that schema
-filtering is required.
+Use `collect_metadata = false` to skip completion metadata for a target. If
+collection crosses `metadata_max_rows`, it stops and warns that schema
+filtering is required. Provider options belong in the target configuration;
+the shared Jusi 1.0 `%%sql` syntax accepts one target alias.
 
 VisiData mappings:
 
@@ -49,6 +49,11 @@ VisiData mappings:
 - `gb`: write the selected raw cell value to a temporary file and open it with
   VisiData. The command prompts for an optional extension; an empty extension
   lets VisiData infer the file type from content and filename.
+
+Follow-up cells reuse the same VisiData application, PostgreSQL connection,
+transaction, and server-side cursors. `JusiInterrupt` requests cancellation on
+that connection. Closing the client closes its cursors, metadata connection,
+main connection, private control socket, and staged launch data.
 
 ## Local development database
 
@@ -62,7 +67,7 @@ The script builds `jusi-postgres-dev`, runs a local container on
 `127.0.0.1:55432`, waits for readiness, and prints this config:
 
 ```toml
-[sql.local_postgres]
+[sql.targets.local_postgres]
 provider = "postgres"
 host = "127.0.0.1"
 port = 55432

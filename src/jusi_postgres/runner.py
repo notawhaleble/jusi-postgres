@@ -1,29 +1,43 @@
 from __future__ import annotations
 
 import json
-import os
-import signal
+import curses
+from pathlib import Path
 import sys
 import tempfile
 import threading
 import uuid
+from collections import deque
 from typing import Any
 
 import visidata
-from visidata import ItemColumn, run, vd
+from visidata import ItemColumn, SequenceSheet, run, vd
 
-from jusi.infrastructure.debug_timing import emit_timing
-from jusi.visidata_support import bind_visidata_runtime, set_plugin_execution_status
-from jusi_sql import BaseSqlSheet, SqlSheetRuntime, install_sql_base_sheet_api, queue_sql_sheet, resolve_sql_target
+from jusi_sql import (
+    MetadataCache,
+    MetadataSnapshot,
+    SqlCompletionRequest,
+    SqlSheetActions,
+    bind_sql_actions,
+    complete_sql,
+    install_visidata_commands,
+    sql_cache_directory,
+)
 
-from .completion import completion_items
 from .config import DEFAULT_METADATA_MAX_ROWS, kerberos_cache_env, parse_postgres_options
 from .constants import POSTGRES_BOOTSTRAP_SQL
-from .metadata import MetadataCache, MetadataSnapshot, load_postgres_metadata
-from .state import target_cache_dir
+from .ipc import ApplicationController
+from .metadata import load_postgres_metadata
 
 
 RESULT_QUERY_PREFIXES = ("select", "with", "values", "table")
+POSTGRES_KEYWORDS = (
+    "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "FULL", "INNER", "OUTER",
+    "ON", "GROUP", "BY", "ORDER", "HAVING", "LIMIT", "OFFSET", "INSERT", "INTO",
+    "VALUES", "UPDATE", "SET", "DELETE", "RETURNING", "WITH", "AS", "DISTINCT",
+    "CREATE", "ALTER", "DROP", "TABLE", "VIEW", "INDEX", "BEGIN", "COMMIT", "ROLLBACK",
+)
+_PENDING_SHEETS: deque[Any] = deque()
 
 
 class RawBinaryValue:
@@ -50,15 +64,6 @@ class RawBinaryValue:
 
     def __repr__(self) -> str:
         return str(self)
-
-
-class PostgresSheetRuntime(SqlSheetRuntime):
-    def handle_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return {"items": list(self.complete(dict(payload)) or ())}
-
-    def handle_followup(self, payload: dict[str, Any]) -> dict[str, Any]:
-        self.followup(dict(payload))
-        return {}
 
 
 class PostgresSession:
@@ -92,7 +97,7 @@ class PostgresSession:
         metadata_cache_options["__metadata_max_rows"] = metadata_max_rows
         metadata_cache_options["__metadata_schemas"] = metadata_schemas
         self.metadata = MetadataCache(
-            target_cache_dir(alias, metadata_cache_options),
+            sql_cache_directory("postgres", alias, metadata_cache_options),
             self._load_metadata,
             on_warning=self._metadata_warning,
         )
@@ -107,7 +112,6 @@ class PostgresSession:
                     self.conn.add_notice_handler(self._notice_handler)
                 except Exception:
                     pass
-                emit_timing("sql.postgres.connection.opened", alias=self.alias)
             return self.conn
 
     def with_connection(self, fn, *, blocking: bool = True):  # type: ignore[no-untyped-def]
@@ -122,29 +126,23 @@ class PostgresSession:
     def register_sheet(self, sheet: "PostgresResultSheet") -> None:
         self.sheets.append(sheet)
 
-    def complete(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    def complete(self, request: SqlCompletionRequest) -> dict[str, Any]:
         self.show_metadata_warnings()
         snapshot = MetadataSnapshot() if not self.collect_metadata else self.metadata.snapshot()
-        items = completion_items(snapshot, payload)
-        emit_timing("sql.postgres.complete", alias=self.alias, item_count=len(items), current_word=str(payload.get("current_word", "")))
-        return items
+        return complete_sql(snapshot, request, keywords=POSTGRES_KEYWORDS)
 
     def enter_cell(self) -> None:
         if not self.collect_metadata:
-            emit_timing("sql.postgres.metadata.enter_cell", alias=self.alias, refresh_started=False, disabled=True)
             return
-        started = self.metadata.ensure_fresh_async()
-        emit_timing("sql.postgres.metadata.enter_cell", alias=self.alias, refresh_started=started)
+        self.metadata.ensure_fresh_async()
 
-    def followup(self, payload: dict[str, Any]) -> None:
-        cell_text = str(payload.get("cell_text", "")).strip()
-        if not cell_text:
+    def followup(self, body: str) -> None:
+        sql = _followup_sql(body).strip()
+        if not sql:
             return
         self.enter_cell()
-        sheet = PostgresResultSheet(session=self, query=cell_text)
-        bind_postgres_runtime(sheet)
-        queue_sql_sheet(sheet)
-        emit_timing("sql.postgres.followup", alias=self.alias, query_len=len(cell_text), sheet=sheet.name)
+        sheet = PostgresResultSheet(session=self, query=sql)
+        _queue_sheet(sheet)
 
     def interrupt(self) -> None:
         conn = self.conn
@@ -152,7 +150,6 @@ class PostgresSession:
             return
         try:
             conn.cancel()
-            set_plugin_execution_status("interrupted")
             vd.warning("PostgreSQL query cancellation requested")
         except Exception as exc:
             vd.warning(f"PostgreSQL cancellation failed: {exc}")
@@ -182,7 +179,6 @@ class PostgresSession:
         conn = self.conn
         if conn is not None and not conn.closed:
             conn.close()
-            emit_timing("sql.postgres.connection.closed", alias=self.alias)
 
     def _load_metadata(self) -> Any:
         with kerberos_cache_env(self.krb5ccname):
@@ -219,7 +215,6 @@ class PostgresSession:
             vd.warning(f"PostgreSQL metadata cancellation failed: {exc}")
 
     def _metadata_warning(self, message: str) -> None:
-        emit_timing("sql.postgres.metadata.warning", alias=self.alias, warning=message)
         with self.metadata_warning_lock:
             self.metadata_warnings.append(message)
 
@@ -245,7 +240,7 @@ class PostgresSession:
             sheet.cursor_closed_reason = reason
 
 
-class PostgresResultSheet(BaseSqlSheet):
+class PostgresResultSheet(SequenceSheet):
     rowtype = "rows"
 
     def __init__(self, *, session: PostgresSession, query: str) -> None:
@@ -258,10 +253,13 @@ class PostgresResultSheet(BaseSqlSheet):
         self.cursor_closed_reason = ""
         self._buffer: list[Any] = []
         session.register_sheet(self)
+        bind_sql_actions(self, SqlSheetActions(
+            fetch_more=self.fetch_more,
+            commit=session.commit,
+            rollback=session.rollback,
+        ))
 
     def iterload(self):  # type: ignore[no-untyped-def]
-        set_plugin_execution_status("busy")
-        emit_timing("sql.postgres.iterload.begin", alias=self.session.alias, query_len=len(self.query))
         try:
             if _looks_like_result_query(self.query):
                 yield from self._load_result_query()
@@ -270,9 +268,6 @@ class PostgresResultSheet(BaseSqlSheet):
         except Exception as exc:
             vd.exceptionCaught(exc)
             vd.warning(f"PostgreSQL query failed: {exc.__class__.__name__}: {exc}; press Ctrl-E for details")
-            emit_timing("sql.postgres.iterload.error", alias=self.session.alias, error_type=type(exc).__name__, error=str(exc))
-        finally:
-            set_plugin_execution_status("follow-up")
 
     def fetch_more(self, count: int) -> int:
         if self.cursor_closed_reason:
@@ -311,7 +306,6 @@ class PostgresResultSheet(BaseSqlSheet):
             column_names = [str(item.name) for item in description] if description else ["result"]
             self.columns = [ItemColumn(name, index) for index, name in enumerate(column_names)]
             rows = self._fetch_rows(self.session.initial_fetch)
-        emit_timing("sql.postgres.iterload.rows", alias=self.session.alias, row_count=len(rows), column_count=len(column_names))
         if description:
             yield column_names
         for row in rows:
@@ -374,59 +368,10 @@ class PostgresResultSheet(BaseSqlSheet):
             vd.status("PostgreSQL cursor exhausted")
 
 
-def bind_postgres_runtime(sheet: PostgresResultSheet) -> None:
-    runtime = PostgresSheetRuntime(
-        alias=sheet.session.alias,
-        provider="postgres",
-        complete=lambda control_payload: sheet.session.complete(control_payload),
-        followup=lambda control_payload: sheet.session.followup(control_payload),
-        interrupt=sheet.session.interrupt,
-        stop=sheet.session.close,
-    )
-    sheet.bind_sql_runtime(runtime)
-    bind_visidata_runtime(sheet, runtime)
-
-
 def install_postgres_commands() -> None:
-    install_sql_base_sheet_api()
-
-    for number in range(1, 10):
-        command_name = f"jusi-postgres-fetch-{number}"
-
-        def _fetch(sheet: Any, n: int = number) -> None:
-            pg_sheet = _postgres_sheet(sheet)
-            if pg_sheet is not None:
-                pg_sheet.fetch_more(n)
-
-        visidata.BaseSheet.command(str(number), command_name, f"fetch {number} PostgreSQL rows", replay=False)(_fetch)
-
-    @visidata.BaseSheet.command("gf", "jusi-postgres-fetch-prompt", "fetch PostgreSQL rows", replay=False)
-    def _fetch_prompt(sheet: Any) -> None:
-        pg_sheet = _postgres_sheet(sheet)
-        if pg_sheet is None:
-            return
-        raw = vd.input("fetch rows (0 for all): ")
-        try:
-            count = int(str(raw).strip())
-        except ValueError:
-            vd.warning("Fetch count must be a number")
-            return
-        if count < 0:
-            vd.warning("Fetch count must be >= 0")
-            return
-        pg_sheet.fetch_more(count)
-
-    @visidata.BaseSheet.command("gc", "jusi-postgres-commit", "commit PostgreSQL transaction", replay=False)
-    def _commit(sheet: Any) -> None:
-        pg_sheet = _postgres_sheet(sheet)
-        if pg_sheet is not None:
-            pg_sheet.session.commit()
-
-    @visidata.BaseSheet.command("gr", "jusi-postgres-rollback", "roll back PostgreSQL transaction", replay=False)
-    def _rollback(sheet: Any) -> None:
-        pg_sheet = _postgres_sheet(sheet)
-        if pg_sheet is not None:
-            pg_sheet.session.rollback()
+    install_visidata_commands(visidata)
+    if getattr(visidata.BaseSheet, "_jusi_postgres_commands_v1", False):
+        return
 
     @visidata.BaseSheet.command("gb", "jusi-postgres-open-raw-value", "open raw PostgreSQL cell value", replay=False)
     def _open_raw_value(sheet: Any) -> None:
@@ -439,6 +384,33 @@ def install_postgres_commands() -> None:
         path = _write_raw_value_file(value, suffix)
         opened = vd.openPath(visidata.Path(path))
         vd.push(opened)
+
+    @visidata.BaseSheet.command("", "jusi-postgres-open-pending-sheet", "open pending PostgreSQL result", replay=False)
+    def _open_pending(_sheet: Any) -> None:
+        if not _PENDING_SHEETS:
+            return
+        next_sheet = _PENDING_SHEETS.popleft()
+        vd.push(next_sheet)
+        next_sheet.ensureLoaded()
+
+    setattr(visidata.BaseSheet, "_jusi_postgres_commands_v1", True)
+
+
+def _queue_sheet(sheet: PostgresResultSheet) -> None:
+    _PENDING_SHEETS.append(sheet)
+    vd.queueCommand("jusi-postgres-open-pending-sheet")
+    try:
+        curses.ungetch(curses.KEY_RESIZE)
+    except Exception:
+        pass
+
+
+def _followup_sql(body: str) -> str:
+    first, separator, remainder = body.partition("\n")
+    header = first.strip()
+    if header == "%%sql" or header.startswith(("%%sql ", "%%sql\t")):
+        return remainder if separator else ""
+    return body
 
 
 def _postgres_sheet(sheet: Any) -> PostgresResultSheet | None:
@@ -540,62 +512,48 @@ def _install_infinity_timestamp_loaders(conn: Any) -> None:
     conn.adapters.register_loader("timestamptz", TimestamptzInfinityLoader)
 
 
-def _load_payload() -> dict[str, Any]:
-    raw = os.environ.get("JUSI_SQL_PAYLOAD_JSON", "").strip()
-    if not raw:
-        raise RuntimeError("missing JUSI_SQL_PAYLOAD_JSON")
-    payload = json.loads(raw)
-    if not isinstance(payload, dict):
-        raise RuntimeError("invalid JUSI_SQL_PAYLOAD_JSON")
-    return payload
+def _read_payload(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    finally:
+        path.unlink(missing_ok=True)
+    if not isinstance(value, dict):
+        raise RuntimeError("invalid PostgreSQL application payload")
+    return value
 
 
-def _postgres_target_options(alias: str, meta: dict[str, Any]) -> dict[str, object]:
-    target_config = meta.get("target_config")
-    if isinstance(target_config, dict):
-        provider = str(target_config.get("provider", "")).strip()
-        if provider and provider != "postgres":
-            raise RuntimeError(f"SQL target {alias!r} resolved to provider {provider!r}, not postgres")
-        return {str(key): value for key, value in target_config.items()}
-
-    session_config = meta.get("session_config")
-    if isinstance(session_config, dict):
-        target = resolve_sql_target(alias, config=session_config)
-        if target.provider != "postgres":
-            raise RuntimeError(f"SQL target {alias!r} resolved to provider {target.provider!r}, not postgres")
-        return dict(target.options)
-
-    raise RuntimeError("missing SQL target config")
-
-
-def _install_signal_handlers(session: PostgresSession) -> None:
-    previous = signal.getsignal(signal.SIGINT)
-
-    def _handle_sigint(signum: int, frame: Any) -> None:
-        _ = (signum, frame)
+def _handle_application_operation(session: PostgresSession, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if operation == "followup":
+        body = payload.get("body")
+        if not isinstance(body, str):
+            raise ValueError("SQL followup requires string body")
+        session.followup(body)
+        return {"accepted": True}
+    if operation == "complete":
+        return session.complete(SqlCompletionRequest.from_payload(payload))
+    if operation == "interrupt":
         session.interrupt()
-        if callable(previous):
-            previous(signum, frame)
-
-    signal.signal(signal.SIGINT, _handle_sigint)
+        return {"accepted": True}
+    raise ValueError(f"unsupported PostgreSQL application operation: {operation}")
 
 
-def run_postgres_runner() -> int:
+def run_postgres_application(payload_path: Path, socket_path: str) -> int:
     session: PostgresSession | None = None
     try:
+        from jusi.plugins.vd.application import install_editor_actions
+
         install_postgres_commands()
+        install_editor_actions()
         visidata.vd.timeouts_before_idle = -1
-        payload = _load_payload()
-        query = str(payload.get("content", "")).strip()
-        meta = payload.get("meta", {})
-        if not isinstance(meta, dict):
-            raise RuntimeError("invalid SQL payload meta")
-        alias = str(meta.get("alias", "")).strip()
+        payload = _read_payload(payload_path)
+        query = str(payload.get("sql", "")).strip() or POSTGRES_BOOTSTRAP_SQL
+        alias = str(payload.get("alias", "")).strip()
         if not alias:
             raise RuntimeError("missing SQL target alias")
-        if not query:
-            query = POSTGRES_BOOTSTRAP_SQL
-        options = parse_postgres_options(_postgres_target_options(alias, meta))
+        raw_options = payload.get("options")
+        if not isinstance(raw_options, dict):
+            raise RuntimeError("missing PostgreSQL target options")
+        options = parse_postgres_options(raw_options)
         session = PostgresSession(
             alias=alias,
             connect_options=options.connect,
@@ -605,17 +563,25 @@ def run_postgres_runner() -> int:
             metadata_max_rows=options.metadata_max_rows,
             metadata_schemas=options.metadata_schemas,
         )
-        _install_signal_handlers(session)
+        controller = ApplicationController(
+            socket_path,
+            lambda operation, control_payload: _handle_application_operation(session, operation, control_payload),
+        )
+        controller.start()
         session.enter_cell()
         sheet = PostgresResultSheet(session=session, query=query)
-        bind_postgres_runtime(sheet)
         run(sheet)
         return 0
     except Exception as exc:
-        emit_timing("sql.postgres.runner.error", error=str(exc), error_type=exc.__class__.__name__)
         sys.stderr.write(str(exc) + "\n")
         sys.stderr.flush()
         return 2
     finally:
         if session is not None:
             session.close()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 4 or sys.argv[1] != "--application":
+        raise SystemExit("PostgreSQL application requires a private payload path and control socket")
+    raise SystemExit(run_postgres_application(Path(sys.argv[2]), sys.argv[3]))
