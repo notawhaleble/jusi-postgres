@@ -32,7 +32,8 @@ class PostgresClientSession:
         socket_path = str(self.runtime_directory / "control.sock")
         try:
             self.payload = StagedApplicationPayload(
-                {"alias": request.alias, "sql": request.sql, "options": request.options},
+                {"alias": request.alias, "sql": request.sql, "options": request.options,
+                 "bootstrap": request.bootstrap},
                 prefix="jusi-postgres-payload-",
             )
             self.bridge = WorkerApplicationBridge(socket_path)
